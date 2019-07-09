@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"fmt"
 	"encoding/json"
 	"net/http"
@@ -9,7 +10,15 @@ import (
 	elastic "gopkg.in/olivere/elastic.v3"
 	"github.com/pborman/uuid"
 	"reflect"
+	"context"
+	"cloud.google.com/go/storage"
+	"github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+
+
 )
+var mySigningKey = []byte("secret")
 
 type Location struct{
 		Lat float64 `json:"lat"`
@@ -21,6 +30,8 @@ type Post struct{
 	User string `json:"user"`
 	Message string `json:"message"`
 	Location Location `json:"location"`
+	Url string `json:"url"`
+	
 }
 const (
 	INDEX = "around"//
@@ -30,7 +41,8 @@ const (
 	//PROJECT_ID = "around-xxx"
 	//BT_INSTANCE = "around-post"
 	// Needs to update this URL if you deploy it to cloud.
-	ES_URL = "http://35.239.4.96:9200/"
+	ES_URL = "http://35.188.79.209:9200/"
+	BUCKET_NAME = "post-images-244920"
 
 )
 func main() {
@@ -67,9 +79,25 @@ func main() {
 	}
 
 	fmt.Println("started-service")
-	http.HandleFunc("/post",handlerPost)//第一个参数是endpoint 第二个参数是endpoint用哪个函数来保存
-	http.HandleFunc("/search",handlerSearch)
-	log.Fatal(http.ListenAndServe(":8080",nil))
+	r := mux.NewRouter()
+
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+		   ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+				  return mySigningKey, nil
+		   },
+		   SigningMethod: jwt.SigningMethodHS256,
+	})
+	//原先是http.Handlerfunc("/post",handlerPost)
+	//先转到jwt中间件 验证token 再转交给http handler
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	//还未login 还没产生token
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+    
+	http.Handle("/", r)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+
 }
 //大写 相当于public 可以外部来引用
 //小写      private 外部无法引用
@@ -79,19 +107,152 @@ func main() {
 //函数里修改r 外面也会变化
 // r是用户提交的 r.body就是引用文字的部分
 func handlerPost(w http.ResponseWriter, r *http.Request){
-	fmt.Println("Received one post request.")
-	decoder := json.NewDecoder(r.Body)
-	var p Post
-	//if 写两个statement 第一个用来初始化一些变量(可以单独写) 第二个做真正的判断
-	//&p 传P的地址 可以直接编辑地址里面的值
-	if err :=decoder.Decode(&p); err!=nil{
-		panic(err)
-		return
-	}
-	id := uuid.New()
-	// Save to ES.
-	saveToES(&p, id)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+   
+	user := r.Context().Value("user")
+    claims := user.(*jwt.Token).Claims
+    username := claims.(jwt.MapClaims)["username"]
+
+
+	 // 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+	 // After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+	 // If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+	 r.ParseMultipartForm(32 << 20)
+
+	 // Parse from form data.
+	 fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	 lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	 lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+	 p := &Post{
+		    User: username.(string),
+			Message: r.FormValue("message"),
+			Location: Location{
+				   Lat: lat,
+				   Lon: lon,
+			},
+	 }
+
+	 id := uuid.New()
+
+	 file, _, err := r.FormFile("image")
+	 if err != nil {
+			http.Error(w, "Image is not available", http.StatusInternalServerError)
+			fmt.Printf("Image is not available %v.\n", err)
+			panic(err)
+	 }
+	 defer file.Close()
+
+	 ctx := context.Background()
+
+	// replace it with your real bucket name.
+	 _, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	 if err != nil {
+			http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+			fmt.Printf("GCS is not setup %v\n", err)
+			panic(err)
+	 }
+
+	 // Update the media link after saving to GCS.
+	 p.Url = attrs.MediaLink
+
+	 // Save to ES.
+	 saveToES(p, id)
+
+	 // Save to BigTable.
+	 //saveToBigTable(p, id)
+
+// 	w.Header().Set("Content-Type","application/json");
+// 	w.Header().Set("Access-Control-Allow-Origin","*");
+// 	w.Header().Set("Access-Control-Allow-Headers","Content-Type,Authorization")
+	
+// 	//提交的data最大32M 2^10*2^10 1024*1024->M
+//     r.ParseMultipartForm(32<<20)
+// 	//parse form data
+// 	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+// 	lat,_:=strconv.ParseFloat(r.FormValue("lat"),64)
+// 	lon,_:=strconv.ParseFloat(r.FormValue("lon"),64)
+//     p := &Post{
+// 		User:    "1111",
+// 		Message: r.FormValue("message"),
+// 		Location: Location{
+// 			   Lat: lat,
+// 			   Lon: lon,
+// 		},
+//  }
+
+// 	id := uuid.New()
+// 	file,_,err:=r.FormFile("image")//读取file类型的数据
+// 	if err!=nil{
+// 		http.Error(w,"Image is not available", http.StatusInternalServerError)
+// 		fmt.Printf("Image is not available %v.\n", err)//%v什么类型都可以
+// 		panic(err)//方便找到出的错误
+// 		return
+// 	}
+// 	defer file.Close()
+// 	ctx := context.Background()
+// 	_,attrs,err:=saveToGCS(ctx,file,BUCKET_NAME,id)
+// 	if err!=nil{
+// 		http.Error(w,"GCS is not setup", http.StatusInternalServerError)
+// 		fmt.Printf("GCS is not setup %v.\n", err)//%v什么类型都可以
+// 		panic(err)//方便找到出的错误
+// 		return
+// 	}
+// 	p.Url=attrs.MediaLink
+// 	saveToES(p, id)
+
+
+	// fmt.Println("Received one post request.")
+	// decoder := json.NewDecoder(r.Body)
+	// var p Post
+	// //if 写两个statement 第一个用来初始化一些变量(可以单独写) 第二个做真正的判断
+	// //&p 传P的地址 可以直接编辑地址里面的值
+	// if err :=decoder.Decode(&p); err!=nil{
+	// 	panic(err)
+	// 	return
+	// }
+	// id := uuid.New()
+	// // Save to ES.
+	// saveToES(&p, id)
 }
+
+
+// Save an image to GCS.
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		   return nil, nil, err
+	}
+	defer client.Close()
+
+	bucket := client.Bucket(bucketName)
+	// Next check if the bucket exists
+	if _, err = bucket.Attrs(ctx); err != nil {
+		   return nil, nil, err
+	}
+
+	obj := bucket.Object(name)
+	w := obj.NewWriter(ctx)
+	if _, err := io.Copy(w, r); err != nil {
+		   return nil, nil, err
+	}
+	if err := w.Close(); err != nil {
+		   return nil, nil, err
+	}
+
+	
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		   return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
+}
+
+
+
 // Save a post to ElasticSearch
 func saveToES(p *Post, id string) {
 	// Create a client
